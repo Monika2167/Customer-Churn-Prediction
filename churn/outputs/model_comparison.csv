@@ -1,0 +1,4 @@
+,roc_auc,precision,recall,f1,brier (calibration)
+logreg,0.839,0.677,0.532,0.596,0.137
+random_forest,0.835,0.67,0.489,0.566,0.139
+xgboost,0.836,0.661,0.505,0.573,0.14
