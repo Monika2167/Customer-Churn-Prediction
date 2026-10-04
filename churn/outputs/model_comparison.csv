@@ -1,4 +1,7 @@
-,roc_auc,precision,recall,f1,brier (calibration)
-logreg,0.839,0.677,0.532,0.596,0.137
-random_forest,0.835,0.67,0.489,0.566,0.139
-xgboost,0.836,0.661,0.505,0.573,0.14
+,roc_auc,pr_auc,precision,recall,f1,brier (calibration)
+logreg,0.839,0.651,0.678,0.529,0.595,0.137
+logreg_weighted,0.839,0.651,0.514,0.778,0.619,0.166
+random_forest,0.836,0.642,0.663,0.5,0.57,0.138
+random_forest_weighted,0.836,0.637,0.529,0.773,0.628,0.16
+xgboost,0.834,0.646,0.661,0.5,0.569,0.14
+xgboost_weighted,0.834,0.637,0.513,0.749,0.609,0.162

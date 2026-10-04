@@ -3,29 +3,38 @@ Customer Churn Prediction - Telco dataset
 Run from the churn/ folder:  python src/churn_pipeline.py
 
 Dataset: WA_Fn-UseC_-Telco-Customer-Churn.csv (Kaggle: "Telco Customer Churn")
-Put it in churn/data/telco_churn.csv
+Save it as churn/data/telco_churn.csv
 """
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-import shap
 from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
+    average_precision_score,
     brier_score_loss,
     f1_score,
     precision_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBClassifier
+
+from churn_utils import (
+    CONTINUOUS_COLS,
+    IQRClipper,
+    add_features,
+    load_and_clean,
+    top_reasons,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = ROOT / "data" / "telco_churn.csv"
@@ -33,101 +42,71 @@ OUT_DIR = ROOT / "outputs"
 OUT_DIR.mkdir(exist_ok=True)
 
 RANDOM_STATE = 42
-# Business costs: missing a churner is assumed 5x worse than a wasted offer.
-COST_FN = 5.0
+# Business-cost ASSUMPTION: missing a churner costs 3x a wasted retention offer.
+# Change these two numbers if your mentor gives real figures.
+COST_FN = 3.0
 COST_FP = 1.0
-
-SERVICE_COLS = [
-    "PhoneService", "MultipleLines", "OnlineSecurity", "OnlineBackup",
-    "DeviceProtection", "TechSupport", "StreamingTV", "StreamingMovies",
-]
+COST_RATIOS_TO_TEST = [1, 2, 3, 5, 10]  # sensitivity table
 
 
 # ----------------------------------------------------------------------------
-# 1. Load + clean
+# Split (shared with make_plots.py so both use exactly the same data)
 # ----------------------------------------------------------------------------
-def load_and_clean(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
-
-    # TotalCharges has blank strings for brand-new customers (tenure == 0)
-    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
-    df["TotalCharges"] = df["TotalCharges"].fillna(0.0)
-
-    df["Churn"] = (df["Churn"].str.strip() == "Yes").astype(int)
-    df["SeniorCitizen"] = df["SeniorCitizen"].astype(int)
-    return df
-
-
-# ----------------------------------------------------------------------------
-# 2. Feature engineering
-# ----------------------------------------------------------------------------
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # How many add-on services the customer actually uses
-    df["num_services"] = sum((df[c] == "Yes").astype(int) for c in SERVICE_COLS)
-    df["has_internet"] = (df["InternetService"] != "No").astype(int)
-
-    # Billing behaviour
-    df["avg_monthly_spend"] = df["TotalCharges"] / df["tenure"].clip(lower=1)
-    # Positive = currently paying more than their historical average (price hike signal)
-    df["charge_delta"] = df["MonthlyCharges"] - df["avg_monthly_spend"]
-
-    # Commitment / lifecycle
-    df["is_month_to_month"] = (df["Contract"] == "Month-to-month").astype(int)
-    df["is_new_customer"] = (df["tenure"] <= 6).astype(int)
-    df["auto_pay"] = df["PaymentMethod"].str.contains("automatic", case=False).astype(int)
-    return df
+def split_data(X, y) -> dict:
+    """Stratified 60 / 20 / 20 train / validation / test."""
+    X_tv, X_test, y_tv, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_tv, y_tv, test_size=0.25, stratify=y_tv, random_state=RANDOM_STATE
+    )
+    return dict(X_train=X_train, X_val=X_val, X_test=X_test, X_tv=X_tv,
+                y_train=y_train, y_val=y_val, y_test=y_test, y_tv=y_tv)
 
 
 # ----------------------------------------------------------------------------
-# 3. Preprocessing + models
+# Preprocessing + models
 # ----------------------------------------------------------------------------
 def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
-    # pandas 3 stores text as "str" dtype (not "object"), so select "everything non-numeric"
     cat_cols = X.select_dtypes(exclude="number").columns.tolist()
-    num_cols = [c for c in X.columns if c not in cat_cols]
+    clip_cols = [c for c in CONTINUOUS_COLS if c in X.columns]
+    other_num = [c for c in X.columns if c not in cat_cols and c not in clip_cols]
     return ColumnTransformer(
         [
-            ("num", StandardScaler(), num_cols),
+            # continuous columns: cap outliers (IQR rule, learned on training data) then scale
+            ("num_clip", Pipeline([("clip", IQRClipper()), ("scale", StandardScaler())]), clip_cols),
+            ("num", StandardScaler(), other_num),
             ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cat_cols),
         ]
     )
 
 
 def build_models(pos_weight: float, preprocessor) -> dict:
+    """Each model twice: plain, and with class-imbalance weighting (*_weighted)."""
     def pipe(clf):
-        # clone the preprocessor so each model fits its own copy
         return Pipeline([("prep", clone(preprocessor)), ("clf", clf)])
 
+    rf = dict(n_estimators=300, min_samples_leaf=5, n_jobs=-1, random_state=RANDOM_STATE)
+    xgb = dict(n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8,
+               colsample_bytree=0.8, eval_metric="logloss", random_state=RANDOM_STATE)
     return {
-        "logreg": pipe(
-            LogisticRegression(max_iter=1000)
-        ),
-        "random_forest": pipe(
-            RandomForestClassifier(
-                n_estimators=300, min_samples_leaf=5, n_jobs=-1, random_state=RANDOM_STATE,
-            )
-        ),
-        "xgboost": pipe(
-            XGBClassifier(
-                n_estimators=300, max_depth=4, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.8,
-                scale_pos_weight=1,  # handles class imbalance
-                eval_metric="logloss", random_state=RANDOM_STATE,
-            )
-        ),
+        "logreg": pipe(LogisticRegression(max_iter=1000)),
+        "logreg_weighted": pipe(LogisticRegression(max_iter=1000, class_weight="balanced")),
+        "random_forest": pipe(RandomForestClassifier(**rf)),
+        "random_forest_weighted": pipe(RandomForestClassifier(class_weight="balanced", **rf)),
+        "xgboost": pipe(XGBClassifier(**xgb)),
+        "xgboost_weighted": pipe(XGBClassifier(scale_pos_weight=pos_weight, **xgb)),
     }
 
 
 # ----------------------------------------------------------------------------
-# 4. Evaluation helpers
+# Evaluation helpers
 # ----------------------------------------------------------------------------
 def evaluate(y_true, proba, threshold=0.5) -> dict:
     pred = (proba >= threshold).astype(int)
     return {
         "roc_auc": roc_auc_score(y_true, proba),
+        "pr_auc": average_precision_score(y_true, proba),
         "precision": precision_score(y_true, pred, zero_division=0),
         "recall": recall_score(y_true, pred),
         "f1": f1_score(y_true, pred),
@@ -135,33 +114,26 @@ def evaluate(y_true, proba, threshold=0.5) -> dict:
     }
 
 
-def best_cost_threshold(y_true, proba) -> float:
-    """Pick the threshold that minimises expected business cost on validation data."""
+def best_cost_threshold(y_true, proba, cost_fn=COST_FN, cost_fp=COST_FP) -> float:
+    """Threshold that minimises expected business cost."""
     best_t, best_cost = 0.5, np.inf
-    for t in np.linspace(0.05, 0.95, 91):
+    for t in np.linspace(0.02, 0.95, 94):
         pred = proba >= t
         fn = ((~pred) & (y_true == 1)).sum()
         fp = (pred & (y_true == 0)).sum()
-        cost = COST_FN * fn + COST_FP * fp
+        cost = cost_fn * fn + cost_fp * fp
         if cost < best_cost:
             best_t, best_cost = t, cost
     return float(best_t)
 
 
-# ----------------------------------------------------------------------------
-# 5. SHAP-based "review reasons" for each customer (uses the XGBoost pipeline)
-# ----------------------------------------------------------------------------
-def top_reasons(xgb_pipe: Pipeline, X: pd.DataFrame, k: int = 3) -> list:
-    prep, clf = xgb_pipe.named_steps["prep"], xgb_pipe.named_steps["clf"]
-    X_t = prep.transform(X)
-    names = prep.get_feature_names_out()
-    shap_vals = shap.TreeExplainer(clf).shap_values(X_t)
-
-    reasons = []
-    for row in shap_vals:
-        idx = np.argsort(row)[::-1][:k]  # features pushing risk up the most
-        reasons.append("; ".join(names[i].split("__", 1)[-1] for i in idx if row[i] > 0))
-    return reasons
+def md_table(df: pd.DataFrame) -> str:
+    """Small markdown table writer (no extra packages needed)."""
+    df = df.reset_index()
+    head = "| " + " | ".join(str(c) for c in df.columns) + " |"
+    sep = "|" + "---|" * len(df.columns)
+    rows = ["| " + " | ".join(str(v) for v in r) + " |" for r in df.values]
+    return "\n".join([head, sep] + rows)
 
 
 # ----------------------------------------------------------------------------
@@ -172,64 +144,127 @@ def main():
     ids = df["customerID"]
     y = df["Churn"]
     X = df.drop(columns=["customerID", "Churn"])
-
     print(f"Rows: {len(df)} | churn rate: {y.mean():.1%}")
 
-    # train / validation / test = 60 / 20 / 20, stratified
-    X_tmp, X_test, y_tmp, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_tmp, y_tmp, test_size=0.25, stratify=y_tmp, random_state=RANDOM_STATE
-    )
+    S = split_data(X, y)
 
-    pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    models = build_models(pos_weight, build_preprocessor(X_train))
+    # ---- Outlier check (training data) ----
+    rows = {}
+    for c in CONTINUOUS_COLS:
+        v = S["X_train"][c]
+        q1, q3 = v.quantile(0.25), v.quantile(0.75)
+        n_out = int(((v < q1 - 1.5 * (q3 - q1)) | (v > q3 + 1.5 * (q3 - q1))).sum())
+        rows[c] = {"values_outside_1.5xIQR": n_out, "pct": round(100 * n_out / len(v), 2)}
+    outliers = pd.DataFrame(rows).T
+    print("\nOutlier check (training data, 1.5 x IQR rule; these get capped in the model):")
+    print(outliers)
+    outliers.to_csv(OUT_DIR / "outlier_check.csv")
 
-    # Fit + compare on validation set
+    # ---- Stage A: compare 6 model variants on validation ----
+    pos_weight = (S["y_train"] == 0).sum() / (S["y_train"] == 1).sum()
+    models = build_models(pos_weight, build_preprocessor(S["X_train"]))
     results = {}
     for name, model in models.items():
-        model.fit(X_train, y_train)
-        proba = model.predict_proba(X_val)[:, 1]
-        results[name] = evaluate(y_val, proba)
-
+        model.fit(S["X_train"], S["y_train"])
+        results[name] = evaluate(S["y_val"], model.predict_proba(S["X_val"])[:, 1])
     comparison = pd.DataFrame(results).T.round(3)
-    print("\nValidation comparison (threshold = 0.5):")
+    print("\nValidation comparison (threshold = 0.5). *_weighted = class-imbalance weighting:")
     print(comparison)
     comparison.to_csv(OUT_DIR / "model_comparison.csv")
 
-    # Choose best model by ROC-AUC, tune threshold on validation, report on test
     best_name = comparison["roc_auc"].idxmax()
-    best_model = models[best_name]
-    threshold = best_cost_threshold(
-        y_val.values, best_model.predict_proba(X_val)[:, 1]
-    )
-    test_proba = best_model.predict_proba(X_test)[:, 1]
-    test_metrics = evaluate(y_test, test_proba, threshold)
-    print(f"\nBest model: {best_name} | cost-optimal threshold: {threshold:.2f}")
+    base = models[best_name]
+    print(f"\nBest model by ROC-AUC: {best_name}")
+
+    # ---- Stage B: calibrated final model + cost-optimal threshold ----
+    # Calibration makes the predicted probability trustworthy (important for a cost threshold,
+    # and for class-weighted models whose raw probabilities are inflated).
+    final = CalibratedClassifierCV(clone(base), method="sigmoid", cv=5)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    # Out-of-fold probabilities on train+validation: every customer is scored by a model
+    # that never saw them, so the threshold is not tuned on training fits.
+    oof = cross_val_predict(clone(final), S["X_tv"], S["y_tv"], cv=skf, method="predict_proba")[:, 1]
+    threshold = best_cost_threshold(S["y_tv"].values, oof)
+
+    final.fit(S["X_tv"], S["y_tv"])
+    test_proba = final.predict_proba(S["X_test"])[:, 1]
+    raw_test_proba = base.predict_proba(S["X_test"])[:, 1]
+
+    test_metrics = evaluate(S["y_test"], test_proba, threshold)
+    pct_flagged = float((test_proba >= threshold).mean())
+    print(f"\nFinal model: {best_name} + sigmoid calibration | cost ratio {COST_FN:g}:{COST_FP:g} "
+          f"| threshold {threshold:.2f}")
     print("Held-out TEST metrics:", {k: round(v, 3) for k, v in test_metrics.items()})
+    print(f"Share of test customers flagged: {pct_flagged:.1%}")
+    print(f"Brier score before calibration: {brier_score_loss(S['y_test'], raw_test_proba):.3f} "
+          f"-> after: {brier_score_loss(S['y_test'], test_proba):.3f}")
 
-    joblib.dump({"model": best_model, "threshold": threshold}, OUT_DIR / "churn_model.joblib")
+    # ---- Cost-ratio sensitivity (how the alert list changes with the assumption) ----
+    sens = {}
+    for r in COST_RATIOS_TO_TEST:
+        t = best_cost_threshold(S["y_tv"].values, oof, cost_fn=float(r), cost_fp=1.0)
+        m = evaluate(S["y_test"], test_proba, t)
+        sens[f"{r}:1"] = {
+            "threshold": round(t, 2),
+            "flagged_pct": round(100 * float((test_proba >= t).mean()), 1),
+            "precision": round(m["precision"], 3),
+            "recall": round(m["recall"], 3),
+        }
+    sensitivity = pd.DataFrame(sens).T
+    sensitivity.index.name = "missed-churner : wasted-offer cost"
+    print("\nCost-ratio sensitivity (test set):")
+    print(sensitivity)
+    sensitivity.to_csv(OUT_DIR / "cost_sensitivity.csv")
 
-    # Ranked high-risk list for the whole customer base, with review reasons
-    all_proba = best_model.predict_proba(X)[:, 1]
+    # ---- Ranked list: every customer scored by a model that never saw them ----
+    scores = pd.Series(index=X.index, dtype=float)
+    scores.loc[S["X_tv"].index] = oof
+    scores.loc[S["X_test"].index] = test_proba
+
+    xgb_explain = models["xgboost"]  # plain XGBoost used only to explain risk drivers
     ranked = pd.DataFrame(
         {
             "customerID": ids,
-            "churn_probability": all_proba.round(3),
-            "high_risk": all_proba >= threshold,
+            "churn_probability": scores.round(3),
+            "high_risk": scores >= threshold,
         }
     )
-    ranked["review_reasons"] = top_reasons(models["xgboost"], X)
+    ranked["review_reasons"] = top_reasons(xgb_explain, X)
     ranked = ranked.sort_values("churn_probability", ascending=False)
     ranked["risk_tier"] = pd.qcut(
-    ranked["churn_probability"].rank(method="first", ascending=False),
-    q=[0, 0.1, 0.3, 1.0],
-    labels=["Critical (top 10%)", "High (next 20%)", "Normal"],
-)
+        ranked["churn_probability"].rank(method="first", ascending=False),
+        q=[0, 0.1, 0.3, 1.0],
+        labels=["Critical (top 10%)", "High (next 20%)", "Normal"],
+    )
     ranked.to_csv(OUT_DIR / "high_risk_customers.csv", index=False)
-    print(f"\nSaved ranked list ({ranked['high_risk'].sum()} high-risk customers) to outputs/")
+    print(f"\nRanked list saved ({int(ranked['high_risk'].sum())} high-risk of {len(ranked)}).")
     print(ranked.head(10).to_string(index=False))
+
+    # ---- Save model bundle (used by the dashboard for live scoring) ----
+    joblib.dump(
+        {"model": final, "threshold": threshold, "xgb_explain": xgb_explain,
+         "best_base": best_name, "cost_fn": COST_FN, "cost_fp": COST_FP},
+        OUT_DIR / "churn_model.joblib",
+    )
+
+    # ---- Summary file you can paste into the README ----
+    summary = [
+        "# Results summary (auto-generated)",
+        f"\nChurn rate: {y.mean():.1%} | customers: {len(df)}",
+        f"\nFinal model: **{best_name}** + sigmoid calibration. Cost assumption "
+        f"{COST_FN:g}:{COST_FP:g} -> alert threshold **{threshold:.2f}**.",
+        "\n## Validation comparison (threshold 0.5)\n", md_table(comparison),
+        "\n## Held-out test metrics (at the alert threshold)\n",
+        md_table(pd.DataFrame([{k: round(v, 3) for k, v in test_metrics.items()}])
+                 .rename(index={0: "final"})),
+        f"\nShare of test customers flagged: {pct_flagged:.1%}. "
+        f"Brier before calibration {brier_score_loss(S['y_test'], raw_test_proba):.3f}, "
+        f"after {brier_score_loss(S['y_test'], test_proba):.3f}.",
+        "\n## Cost-ratio sensitivity (test set)\n", md_table(sensitivity),
+        "\n## Outlier check (training data)\n", md_table(outliers),
+    ]
+    (OUT_DIR / "results_summary.md").write_text("\n".join(summary), encoding="utf-8")
+    print("\nSaved outputs/results_summary.md (paste its tables into the README).")
 
 
 if __name__ == "__main__":

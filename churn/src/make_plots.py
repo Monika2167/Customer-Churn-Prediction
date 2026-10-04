@@ -1,59 +1,73 @@
 """
-Saves ROC curve, confusion matrix and SHAP summary plot into churn/outputs/.
+Saves ROC curve, confusion matrix, calibration curve and SHAP summary into churn/outputs/.
 Run AFTER churn_pipeline.py, from the churn/ folder:  python src/make_plots.py
 """
 import joblib
 import matplotlib
 
-matplotlib.use("Agg")  # no window needed, just save files
+matplotlib.use("Agg")  # save files, no window
 import matplotlib.pyplot as plt
+import pandas as pd
 import shap
+from sklearn.calibration import CalibrationDisplay
 from sklearn.metrics import ConfusionMatrixDisplay, RocCurveDisplay
-from sklearn.model_selection import train_test_split
 
-import churn_pipeline as cp  # reuses the same cleaning, features and models
+import churn_pipeline as cp  # same split, preprocessing and models as the pipeline
+from churn_utils import add_features, load_and_clean
 
-df = cp.add_features(cp.load_and_clean(cp.DATA_PATH))
+df = add_features(load_and_clean(cp.DATA_PATH))
 y = df["Churn"]
 X = df.drop(columns=["customerID", "Churn"])
+S = cp.split_data(X, y)
 
-# Same split as the pipeline (same random_state) so test data is truly unseen
-X_tmp, X_test, y_tmp, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=cp.RANDOM_STATE
-)
-X_train, X_val, y_train, y_val = train_test_split(
-    X_tmp, y_tmp, test_size=0.25, stratify=y_tmp, random_state=cp.RANDOM_STATE
-)
-
-pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-models = cp.build_models(pos_weight, cp.build_preprocessor(X_train))
+pos_weight = (S["y_train"] == 0).sum() / (S["y_train"] == 1).sum()
+models = cp.build_models(pos_weight, cp.build_preprocessor(S["X_train"]))
 for m in models.values():
-    m.fit(X_train, y_train)
+    m.fit(S["X_train"], S["y_train"])
 
-# 1) ROC curves for all three models on the test set
+bundle = joblib.load(cp.OUT_DIR / "churn_model.joblib")
+final, thr = bundle["model"], bundle["threshold"]
+best_name = bundle["best_base"]
+X_test, y_test = S["X_test"], S["y_test"]
+final_proba = final.predict_proba(X_test)[:, 1]
+
+# 1) ROC curves (test set)
 fig, ax = plt.subplots(figsize=(6, 5))
-for name, m in models.items():
-    RocCurveDisplay.from_estimator(m, X_test, y_test, ax=ax, name=name)
+for name in ["logreg", "random_forest", "xgboost"]:
+    RocCurveDisplay.from_estimator(models[name], X_test, y_test, ax=ax, name=name)
+RocCurveDisplay.from_predictions(y_test, final_proba, ax=ax, name="final (calibrated)")
 ax.plot([0, 1], [0, 1], "k--", alpha=0.4)
 ax.set_title("ROC curves (test set)")
 fig.tight_layout()
 fig.savefig(cp.OUT_DIR / "roc_curve.png", dpi=150)
 plt.close(fig)
 
-# 2) Confusion matrix for the saved best model at its cost-optimal threshold
-bundle = joblib.load(cp.OUT_DIR / "churn_model.joblib")
-proba = bundle["model"].predict_proba(X_test)[:, 1]
-pred = (proba >= bundle["threshold"]).astype(int)
+# 2) Confusion matrix at the cost-optimal threshold
 fig, ax = plt.subplots(figsize=(5, 4))
 ConfusionMatrixDisplay.from_predictions(
-    y_test, pred, display_labels=["Stay", "Churn"], ax=ax, colorbar=False
+    y_test, (final_proba >= thr).astype(int),
+    display_labels=["Stay", "Churn"], ax=ax, colorbar=False,
 )
-ax.set_title(f"Confusion matrix (threshold = {bundle['threshold']:.2f})")
+ax.set_title(f"Confusion matrix (threshold = {thr:.2f})")
 fig.tight_layout()
 fig.savefig(cp.OUT_DIR / "confusion_matrix.png", dpi=150)
 plt.close(fig)
 
-# 3) SHAP summary (XGBoost): which features push churn risk up or down
+# 3) Calibration curve: predicted probability vs what really happened
+fig, ax = plt.subplots(figsize=(5.5, 5))
+CalibrationDisplay.from_predictions(
+    y_test, models[best_name].predict_proba(X_test)[:, 1],
+    n_bins=10, strategy="quantile", ax=ax, name=f"{best_name} (raw)",
+)
+CalibrationDisplay.from_predictions(
+    y_test, final_proba, n_bins=10, strategy="quantile", ax=ax, name="final (calibrated)",
+)
+ax.set_title("Calibration (closer to the diagonal is better)")
+fig.tight_layout()
+fig.savefig(cp.OUT_DIR / "calibration_curve.png", dpi=150)
+plt.close(fig)
+
+# 4) SHAP summary (plain XGBoost): which features push churn risk up or down
 xgb = models["xgboost"]
 prep, clf = xgb.named_steps["prep"], xgb.named_steps["clf"]
 X_t = prep.transform(X_test)
@@ -65,4 +79,4 @@ plt.tight_layout()
 plt.savefig(cp.OUT_DIR / "shap_summary.png", dpi=150, bbox_inches="tight")
 plt.close()
 
-print("Saved roc_curve.png, confusion_matrix.png, shap_summary.png to outputs/")
+print("Saved roc_curve.png, confusion_matrix.png, calibration_curve.png, shap_summary.png to outputs/")
